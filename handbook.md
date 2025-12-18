@@ -5725,6 +5725,728 @@ Content-Type: application/json
 
 ### 23. Repository Discovery Pattern Explained
 
+#### What is Repository Discovery Pattern?
+
+The Repository Discovery Pattern is a **Service Locator** variant that enables **dynamic runtime lookup** of repositories by resource name. Instead of injecting every possible repository into a class constructor, logic classes can discover and access any repository on-demand through a central registry.
+
+```mermaid
+sequenceDiagram
+    participant Bootstrap as Bootstrap Process
+    participant RepoDiscovery as RepoDiscovery Registry
+    participant Logic as Logic Class
+    participant CoreProvider
+    participant CategoryRepo as Category Repository
+    participant ProductRepo as Product Repository
+    
+    rect rgb(255, 250, 205)
+        Note over Bootstrap,RepoDiscovery: Registration Phase (Startup)
+        Bootstrap->>RepoDiscovery: registerRepository('Products', productRepo)
+        Bootstrap->>RepoDiscovery: registerRepository('Categories', categoryRepo)
+        Bootstrap->>RepoDiscovery: registerRepository('Templates', templateRepo)
+        Note over RepoDiscovery: Registry: Map<string, IRepository>
+    end
+    
+    rect rgb(240, 248, 255)
+        Note over Logic,ProductRepo: Usage Phase (Runtime)
+        Logic->>CoreProvider: getRepoDiscovery()
+        CoreProvider-->>Logic: RepoDiscovery instance
+        
+        Logic->>RepoDiscovery: getRepository('Categories')
+        RepoDiscovery-->>Logic: CategoryRepository
+        
+        Logic->>CategoryRepo: read({filter: {id: categoryId}})
+        CategoryRepo-->>Logic: Category data
+        
+        Note over Logic: Validate category exists<br/>Apply business rules
+        
+        Logic->>RepoDiscovery: getRepository('Products')
+        RepoDiscovery-->>Logic: ProductRepository (own repo)
+        
+        Logic->>ProductRepo: create(productData)
+        ProductRepo-->>Logic: Created product
+    end
+    
+    style Bootstrap fill:#90EE90
+    style RepoDiscovery fill:#FFE4B5
+
+#### Why Repository Discovery Pattern?
+
+**Problems Solved:**
+
+1. **Constructor Injection Explosion**:
+```typescript
+// ❌ WITHOUT Repository Discovery - Constructor hell
+class ProductCreateLogic {
+    constructor(
+        request: IRequest,
+        productRepo: IProductRepository,
+        categoryRepo: ICategoryRepository,  // Need to inject every repo
+        templateRepo: ITemplateRepository,
+        auditRepo: IAuditRepository,
+        validationRepo: IValidationRepository,
+        // ... potentially 10+ repositories
+    ) {}
+}
+```
+
+2. **Static Dependencies**:
+```typescript
+// ❌ WITHOUT Repository Discovery - Static, inflexible
+class ProductCreateLogic {
+    private categoryRepo: ICategoryRepository;
+    
+    constructor(request: IRequest, repository: ICoreRepository) {
+        this.categoryRepo = new CategoryRepository(); // Hardcoded!
+    }
+}
+```
+
+3. **Cross-Resource Coupling**:
+```typescript
+// ❌ WITHOUT Repository Discovery - Tight coupling
+class ProductCreateLogic {
+    // Must know about Categories at compile time
+    // Can't dynamically access other resources
+    // Hard to test with mocks
+}
+```
+
+**Solutions with Repository Discovery:**
+
+```typescript
+// ✅ WITH Repository Discovery - Clean, flexible
+class ProductCreateLogic {
+    constructor(
+        request: IRequest,
+        repository: ICoreRepository  // Only inject own repository
+    ) {
+        this.request = request;
+        this.repository = repository;  // ProductRepository
+        this.coreProvider = CoreProvider.getInstance();
+    }
+    
+    async execute() {
+        // Discover repositories at runtime as needed
+        const categoryRepo = this.coreProvider
+            .getRepoDiscovery()
+            .getRepository('Categories');
+        
+        const templateRepo = this.coreProvider
+            .getRepoDiscovery()
+            .getRepository('Templates');
+        
+        // Use discovered repositories
+        const category = await categoryRepo.read({filter: {id: this.request.body.categoryId}});
+        const template = await templateRepo.read({filter: {id: this.request.body.templateId}});
+    }
+}
+```
+
+#### How It Works: Step-by-Step
+
+**Step 1: Repository Registration (Bootstrap Phase)**
+
+```typescript
+// From src/bootstrap.ts:482
+repoDiscovery.registerRepository(resource.name, resourceBaseRepoAdapter);
+
+// What gets registered:
+{
+    'Products': ProductRepositoryInstance,
+    'Categories': CategoryRepositoryInstance,
+    'Templates': TemplateRepositoryInstance,
+    'Users': UserRepositoryInstance,
+    'Dpps': DppRepositoryInstance,
+    // ... 30+ more repositories
+}
+```
+
+**Step 2: Discovery Service Creation**
+
+```typescript
+// From src/infra/factories/dependency-factory.ts:186-190
+createRepoDiscovery(): IRepoDiscovery {
+    if (!this.repoDiscovery) {
+        this.repoDiscovery = RepoDiscoveryLite.getInstance();  // Singleton
+    }
+    return this.repoDiscovery;
+}
+
+// RepoDiscoveryLite implementation (conceptual)
+class RepoDiscoveryLite implements IRepoDiscovery {
+    private static instance: RepoDiscoveryLite;
+    private repositories: Map<string, IRepository> = new Map();
+    
+    static getInstance(): RepoDiscoveryLite {
+        if (!RepoDiscoveryLite.instance) {
+            RepoDiscoveryLite.instance = new RepoDiscoveryLite();
+        }
+        return RepoDiscoveryLite.instance;
+    }
+    
+    registerRepository(name: string, repository: IRepository): void {
+        this.repositories.set(name, repository);
+    }
+    
+    getRepository(name: string): IRepository {
+        const repo = this.repositories.get(name);
+        if (!repo) {
+            throw new Error(`Repository not found: ${name}`);
+        }
+        return repo;
+    }
+    
+    hasRepository(name: string): boolean {
+        return this.repositories.has(name);
+    }
+    
+    getAllRepositoryNames(): string[] {
+        return Array.from(this.repositories.keys());
+    }
+}
+```
+
+**Step 3: Access Through CoreProvider**
+
+```typescript
+// From src/core/providers/core.provider.ts
+export class CoreProvider {
+    getRepoDiscovery(): IRepoDiscovery {
+        return this.coreDependency.getRepoDiscovery();
+    }
+}
+
+// Usage in any logic class
+const coreProvider = CoreProvider.getInstance();
+const repoDiscovery = coreProvider.getRepoDiscovery();
+const categoryRepo = repoDiscovery.getRepository('Categories');
+```
+
+#### Real-World Usage Examples from BYO DPP
+
+**Example 1: TemplatesCreateLogic validates referenced fields**
+
+```typescript
+// From src/core/logics/v1/templates/crud/templates-create.logic.ts
+export class TemplatesCreateLogic implements ILogic {
+    async execute() {
+        const { metadata } = this.request.body;
+        
+        // Need to validate that template field ULIDs exist
+        if (metadata && typeof metadata === 'object') {
+            const ulids = this.extractUlidsFromTemplateMetadata(metadata);
+            
+            if (ulids.size > 0) {
+                // ✅ Discover TemplateFields repository at runtime
+                const templateFieldsRepo = this.coreProvider
+                    .getRepoDiscovery()
+                    .getRepository('TemplateFields');
+                
+                // Validate ULIDs exist
+                const query = {
+                    fields: ['ulid'],
+                    filter: { ulid: { in: Array.from(ulids) } }
+                };
+                
+                const result = await templateFieldsRepo.list(query);
+                const returnedUlids = new Set(
+                    (result?.data || []).map((r: { ulid: string }) => r.ulid)
+                );
+                
+                if (returnedUlids.size !== ulids.size) {
+                    const missing = Array.from(ulids).filter(u => !returnedUlids.has(u));
+                    throw this.errorFactory.create(
+                        'BadRequestError',
+                        `Unknown template field ULID(s): ${missing.join(', ')}`
+                    );
+                }
+            }
+        }
+        
+        return await this.repository.create(this.request.body);
+    }
+}
+```
+
+**Example 2: ProductCreateLogic validates category**
+
+```typescript
+// Conceptual example based on codebase pattern
+export class ProductCreateLogic implements ILogic {
+    async execute() {
+        // ✅ Discover CategoryRepository at runtime
+        const categoryRepo = this.coreProvider
+            .getRepoDiscovery()
+            .getRepository('Categories');
+        
+        // Validate category exists
+        const category = await categoryRepo.read({
+            filter: { id: { eq: this.request.body.categoryId } }
+        });
+        
+        if (!category.success) {
+            throw this.errorFactory.create(
+                'BadRequestError',
+                `Category with ID ${this.request.body.categoryId} does not exist`
+            );
+        }
+        
+        // Validate category is active
+        if (!category.data.isActive) {
+            throw this.errorFactory.create(
+                'BadRequestError',
+                'Cannot create product in inactive category'
+            );
+        }
+        
+        // Check product limit for category
+        const categoryProductCount = await this.repository.list({
+            filter: { categoryId: { eq: this.request.body.categoryId } }
+        });
+        
+        if (categoryProductCount.count >= category.data.maxProducts) {
+            throw this.errorFactory.create(
+                'BadRequestError',
+                `Category has reached maximum product limit of ${category.data.maxProducts}`
+            );
+        }
+        
+        // Create product
+        return await this.repository.create(this.request.body);
+    }
+}
+```
+
+**Example 3: Cross-Resource Transaction with Discovery**
+
+```typescript
+class DppCreateLogic implements ILogic {
+    async execute() {
+        // Discover multiple repositories for cross-resource operation
+        const productRepo = this.coreProvider.getRepoDiscovery().getRepository('Products');
+        const templateRepo = this.coreProvider.getRepoDiscovery().getRepository('Templates');
+        const auditRepo = this.coreProvider.getRepoDiscovery().getRepository('AuditLogs');
+        
+        // Validate product exists
+        const product = await productRepo.read({
+            filter: { id: { eq: this.request.body.productId } }
+        });
+        
+        // Validate template is compatible
+        const template = await templateRepo.read({
+            filter: { id: { eq: this.request.body.templateId } }
+        });
+        
+        if (product.data.categoryId !== template.data.categoryId) {
+            throw this.errorFactory.create(
+                'BadRequestError',
+                'Template not compatible with product category'
+            );
+        }
+        
+        // Create DPP
+        const dpp = await this.repository.create(this.request.body);
+        
+        // Create audit log
+        await auditRepo.create({
+            action: 'CREATE_DPP',
+            resourceType: 'Dpp',
+            resourceId: dpp.data.id,
+            userId: this.request.user?.id,
+            details: {
+                productId: product.data.id,
+                templateId: template.data.id
+            }
+        });
+        
+        return dpp;
+    }
+}
+```
+
+#### Benefits of Repository Discovery Pattern
+
+**1. Reduced Constructor Complexity**
+```typescript
+// Before (Constructor Injection)
+constructor(
+    request: IRequest,
+    repository: ICoreRepository,
+    categoryRepo: ICategoryRepository,      // Explicit injection
+    templateRepo: ITemplateRepository,      // Explicit injection
+    auditRepo: IAuditRepository,            // Explicit injection
+    validationRepo: IValidationRepository   // Explicit injection
+) {}
+
+// After (Repository Discovery)
+constructor(
+    request: IRequest,
+    repository: ICoreRepository  // Only inject own repository
+) {
+    this.coreProvider = CoreProvider.getInstance();  // Access discovery via provider
+}
+```
+
+**2. Dynamic Resource Access**
+```typescript
+// Can access any registered repository at runtime
+async validateReferences(resourceName: string, ids: number[]) {
+    const repo = this.coreProvider.getRepoDiscovery().getRepository(resourceName);
+    const results = await repo.list({ filter: { id: { in: ids } } });
+    return results.count === ids.length;
+}
+```
+
+**3. Loose Coupling**
+```typescript
+// Logic class doesn't depend on specific repositories
+// Dependencies resolved at runtime, not compile time
+// Easy to add new resources without changing existing logic
+```
+
+**4. Testing Flexibility**
+```typescript
+// Can mock entire discovery service
+const mockRepoDiscovery = {
+    getRepository: jest.fn((name) => {
+        if (name === 'Categories') return mockCategoryRepo;
+        if (name === 'Templates') return mockTemplateRepo;
+        return mockGenericRepo;
+    })
+};
+
+const mockCoreProvider = {
+    getRepoDiscovery: () => mockRepoDiscovery
+};
+
+jest.spyOn(CoreProvider, 'getInstance').mockReturnValue(mockCoreProvider);
+```
+
+#### When to Use Repository Discovery
+
+**✅ Use Repository Discovery When:**
+- Logic class needs to access multiple resource repositories
+- Repository requirements are dynamic or conditional
+- Want to avoid constructor injection explosion
+- Need runtime flexibility for which repositories to access
+- Want to maintain loose coupling between logic classes
+
+**❌ Don't Use Repository Discovery When:**
+- Only accessing own repository (use injected `this.repository`)
+- Dependencies are known and fixed at compile time
+- Want explicit dependency declaration for clarity
+- Testing with specific mock implementations
+
+#### Architecture Comparison
+
+**Pattern 1: Constructor Injection (Traditional)**
+```typescript
+class ProductCreateLogic {
+    constructor(
+        request: IRequest,
+        private productRepo: IProductRepository,
+        private categoryRepo: ICategoryRepository,
+        private auditRepo: IAuditRepository
+    ) {}
+    
+    async execute() {
+        const category = await this.categoryRepo.findById(this.request.body.categoryId);
+        // ...
+    }
+}
+```
+**Pros**: Explicit dependencies, easy to see what's needed
+**Cons**: Constructor bloat, tight coupling, hard to extend
+
+**Pattern 2: Service Locator (Repository Discovery)**
+```typescript
+class ProductCreateLogic {
+    constructor(
+        request: IRequest,
+        repository: ICoreRepository
+    ) {
+        this.coreProvider = CoreProvider.getInstance();
+    }
+    
+    async execute() {
+        const categoryRepo = this.coreProvider.getRepoDiscovery().getRepository('Categories');
+        const category = await categoryRepo.findById(this.request.body.categoryId);
+        // ...
+    }
+}
+```
+**Pros**: Clean constructor, flexible, loose coupling, easy to extend
+**Cons**: Hidden dependencies, potential runtime errors if repository not registered
+
+**BYO DPP Choice**: Hybrid approach
+- Inject own repository (explicit dependency)
+- Discover other repositories as needed (flexible access)
+- Best of both worlds!
+
+#### Common Usage Patterns
+
+**Pattern 1: Reference Validation**
+```typescript
+async validateReferences() {
+    // Validate category exists
+    const categoryRepo = this.coreProvider.getRepoDiscovery().getRepository('Categories');
+    const category = await categoryRepo.read({ filter: { id: this.request.body.categoryId } });
+    
+    if (!category.success) {
+        throw this.errorFactory.create('BadRequestError', 'Category not found');
+    }
+}
+```
+
+**Pattern 2: Cross-Resource Business Rules**
+```typescript
+async enforceBusinessRules() {
+    // Get related resources
+    const userRepo = this.coreProvider.getRepoDiscovery().getRepository('Users');
+    const tenantRepo = this.coreProvider.getRepoDiscovery().getRepository('Tenants');
+    
+    // Check tenant quota
+    const user = await userRepo.read({ filter: { id: this.request.user.id } });
+    const tenant = await tenantRepo.read({ filter: { id: user.data.tenantId } });
+    
+    if (tenant.data.productQuota >= tenant.data.maxProducts) {
+        throw this.errorFactory.create('ForbiddenError', 'Tenant product quota exceeded');
+    }
+}
+```
+
+**Pattern 3: Audit Trail Creation**
+```typescript
+async createAuditLog(action: string, resourceId: number) {
+    const auditRepo = this.coreProvider.getRepoDiscovery().getRepository('AuditLogs');
+    
+    await auditRepo.create({
+        action,
+        resourceType: this.repository.modelName,
+        resourceId,
+        userId: this.request.user?.id,
+        timestamp: new Date(),
+        details: { /* ... */ }
+    });
+}
+```
+
+#### Advanced Usage: Dynamic Resource Access
+
+**Scenario**: Generic validation logic for any resource
+
+```typescript
+class GenericReferenceValidator {
+    async validateForeignKeys(
+        references: Array<{resourceName: string; fieldName: string; id: number}>
+    ): Promise<void> {
+        for (const ref of references) {
+            // Dynamically access repository by name
+            const repo = this.coreProvider
+                .getRepoDiscovery()
+                .getRepository(ref.resourceName);
+            
+            const exists = await repo.read({
+                filter: { id: { eq: ref.id } }
+            });
+            
+            if (!exists.success) {
+                throw this.errorFactory.create(
+                    'BadRequestError',
+                    `Referenced ${ref.resourceName} with ID ${ref.id} does not exist`
+                );
+            }
+        }
+    }
+}
+
+// Usage
+await this.validateForeignKeys([
+    { resourceName: 'Categories', fieldName: 'categoryId', id: payload.categoryId },
+    { resourceName: 'Templates', fieldName: 'templateId', id: payload.templateId },
+    { resourceName: 'Units', fieldName: 'unitId', id: payload.unitId }
+]);
+```
+
+#### Performance Considerations
+
+**Repository Instance Reuse:**
+```typescript
+// RepoDiscovery returns same instance (singleton per resource)
+const repo1 = repoDiscovery.getRepository('Products');
+const repo2 = repoDiscovery.getRepository('Products');
+// repo1 === repo2 (same instance, no re-creation)
+```
+
+**Lazy Loading:**
+```typescript
+// Repositories only accessed when needed
+// No upfront cost for unused repositories
+async execute() {
+    if (this.needsCategoryValidation()) {
+        // Only retrieve when needed
+        const categoryRepo = this.coreProvider.getRepoDiscovery().getRepository('Categories');
+        await this.validateCategory(categoryRepo);
+    }
+}
+```
+
+#### Testing with Repository Discovery
+
+**Mock Setup:**
+```typescript
+describe('ProductCreateLogic', () => {
+    let mockRepoDiscovery: jest.Mocked<IRepoDiscovery>;
+    let mockCategoryRepo: jest.Mocked<ICoreRepository>;
+    let mockAuditRepo: jest.Mocked<ICoreRepository>;
+    
+    beforeEach(() => {
+        // Mock repositories
+        mockCategoryRepo = {
+            read: jest.fn(),
+            list: jest.fn(),
+            create: jest.fn()
+        } as any;
+        
+        mockAuditRepo = {
+            create: jest.fn()
+        } as any;
+        
+        // Mock discovery to return mocks
+        mockRepoDiscovery = {
+            getRepository: jest.fn((name) => {
+                if (name === 'Categories') return mockCategoryRepo;
+                if (name === 'AuditLogs') return mockAuditRepo;
+                throw new Error(`Unexpected repository: ${name}`);
+            })
+        } as any;
+        
+        // Mock CoreProvider
+        const mockCoreProvider = {
+            getRepoDiscovery: jest.fn(() => mockRepoDiscovery),
+            getErrorFactory: jest.fn(() => errorFactory)
+        } as any;
+        
+        jest.spyOn(CoreProvider, 'getInstance').mockReturnValue(mockCoreProvider);
+    });
+    
+    it('should validate category exists', async () => {
+        // Arrange
+        mockCategoryRepo.read.mockResolvedValue({
+            success: true,
+            data: { id: 1, name: 'Electronics', isActive: true }
+        });
+        
+        // Act
+        const logic = new ProductCreateLogic(request, productRepository);
+        await logic.execute();
+        
+        // Assert
+        expect(mockRepoDiscovery.getRepository).toHaveBeenCalledWith('Categories');
+        expect(mockCategoryRepo.read).toHaveBeenCalledWith({
+            filter: { id: { eq: request.body.categoryId } }
+        });
+    });
+});
+```
+
+#### Comparison: Repository Discovery vs Alternatives
+
+| Aspect | Constructor Injection | Service Locator | Repository Discovery (BYO DPP) |
+|--------|----------------------|----------------|-------------------------------|
+| **Dependency Visibility** | ✅ Explicit | ❌ Hidden | ⚠️ Semi-hidden (via provider) |
+| **Constructor Complexity** | ❌ Can explode | ✅ Clean | ✅ Clean |
+| **Runtime Flexibility** | ❌ Fixed | ✅ Dynamic | ✅ Dynamic |
+| **Compile-Time Safety** | ✅ Type-safe | ❌ Runtime errors | ⚠️ String-based lookup |
+| **Testing** | ✅ Easy to mock | ⚠️ Need setup | ✅ Easy with CoreProvider mock |
+| **Loose Coupling** | ⚠️ Medium | ✅ High | ✅ High |
+| **Discoverability** | ✅ Easy to see deps | ❌ Hidden | ⚠️ Must check code |
+
+#### Best Practices
+
+**1. Always Check Repository Exists**
+```typescript
+// ✅ GOOD: Handle missing repository
+const repoDiscovery = this.coreProvider.getRepoDiscovery();
+if (!repoDiscovery.hasRepository('OptionalResource')) {
+    // Handle gracefully
+    return;
+}
+const repo = repoDiscovery.getRepository('OptionalResource');
+```
+
+**2. Cache Repository References**
+```typescript
+// ✅ GOOD: Cache for multiple uses
+async execute() {
+    const categoryRepo = this.coreProvider.getRepoDiscovery().getRepository('Categories');
+    
+    // Use multiple times without re-fetching
+    const category1 = await categoryRepo.read({filter: {id: 1}});
+    const category2 = await categoryRepo.read({filter: {id: 2}});
+}
+```
+
+**3. Document Dependencies**
+```typescript
+/**
+ * ProductCreateLogic
+ * 
+ * @description Creates a new product with validation
+ * 
+ * @repositories
+ * - Products: Direct injection (this.repository)
+ * - Categories: Via discovery (validates category exists)
+ * - AuditLogs: Via discovery (creates audit trail)
+ * 
+ * @businessRules
+ * - Category must exist and be active
+ * - Product name must be unique within category
+ * - Tenant must not exceed product quota
+ */
+export class ProductCreateLogic implements ILogic {
+    // Implementation
+}
+```
+
+#### Summary: Repository Discovery in BYO DPP
+
+**Core Concept**: Centralized registry + dynamic lookup = flexible, loosely-coupled architecture
+
+**Key Files**:
+- **Registry**: `src/infra/adapters/repo-discovery/lite.repo-discovery.ts`
+- **Registration**: `src/bootstrap.ts:482`
+- **Access Point**: `src/core/providers/core.provider.ts`
+- **Usage Example**: `src/core/logics/v1/templates/crud/templates-create.logic.ts`
+
+**When Logic Class Needs Another Repository**:
+```
+Logic needs CategoryRepository
+    ↓
+Access CoreProvider.getInstance()
+    ↓
+Get RepoDiscovery service
+    ↓
+Call getRepository('Categories')
+    ↓
+Receive CategoryRepository instance
+    ↓
+Use repository methods (read, list, create, etc.)
+```
+
+**Benefits in BYO DPP**:
+- ✅ **Scalability**: Add new resources without changing logic classes
+- ✅ **Flexibility**: Logic determines which repositories to access
+- ✅ **Maintainability**: Clear separation between resource logic
+- ✅ **Testability**: Easy to mock entire discovery mechanism
+- ✅ **Consistency**: Same pattern across all logic classes
+
+The Repository Discovery Pattern is a core architectural decision in BYO DPP that enables the dynamic, flexible, and maintainable resource system.
+
+    style Logic fill:#E0FFFF
+```
+
+
 #### Cross-Resource Repository Access
 
 **Registration During Bootstrap**:
